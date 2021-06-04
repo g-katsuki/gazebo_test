@@ -21,6 +21,8 @@ namespace rs = project_ryusei;
 using namespace std;
 using namespace std::chrono_literals;
 
+#define DEBUG 1  // to create potential map
+
 namespace potential
 {
 
@@ -70,6 +72,7 @@ private:
   rs::Pose2D pose_;
   rs::Pose2D goal_;
   rs::Pose2D goal_abs_;
+  rs::Pose2D goal_next_;
   std::vector<cv::Point3f> points_scan_;
   std::mutex mutex_;
   nav_msgs::msg::Odometry robot_odom_;
@@ -83,6 +86,7 @@ private:
   void onScanSubscribed(sensor_msgs::msg::LaserScan::SharedPtr msg);
   void onOdomSubscribed(nav_msgs::msg::Odometry::SharedPtr msg);
   void onGoalSubscribed(std_msgs::msg::Float32MultiArray::SharedPtr msg);
+  void on2GoalsSubscribed(std_msgs::msg::Float32MultiArray::SharedPtr msg);
   void create_potential_map();
   rs::Pose2D relGoalToAbs(const nav_msgs::msg::Odometry odom_start, const nav_msgs::msg::Odometry odom_now,
                           const double yaw_start, const double yaw_now, const rs::Pose2D goal);
@@ -90,6 +94,7 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr sub_scan_;  // SharedPtrつけ忘れ注意
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr sub_pose_;
   rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr sub_goal_;
+  rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr sub_2goals_;
   rclcpp::Publisher<std_msgs::msg::Float64>::SharedPtr pub_angle_;
 };
 
@@ -103,6 +108,8 @@ PotentialAngle::PotentialAngle(rclcpp::NodeOptions options) : Node("potential_an
   sub_pose_ = this->create_subscription<nav_msgs::msg::Odometry>("/odom", 10,
                           std::bind(&PotentialAngle::onOdomSubscribed, this, _1));
   sub_goal_ = this->create_subscription<std_msgs::msg::Float32MultiArray>("/goal", 10,
+                          std::bind(&PotentialAngle::onGoalSubscribed, this, _1));
+  sub_2goals_ = this->create_subscription<std_msgs::msg::Float32MultiArray>("/goals", 10,
                           std::bind(&PotentialAngle::onGoalSubscribed, this, _1));
   pub_angle_ = this->create_publisher<std_msgs::msg::Float64>("/angle", 10);
 
@@ -152,29 +159,6 @@ void PotentialAngle::onScanSubscribed(const sensor_msgs::msg::LaserScan::SharedP
     detector_.visualizeLocalMapScan(points_scan_);
     detector_.detect(pose_, obstacles_);
 
-    /*** 相対座標からみたgoalへのxとyの距離 ***/
-    // double dis_to_goal_x = goal_.x - (robot_odom_.pose.pose.position.x
-    //                        - robot_odom_ini_.pose.pose.position.x);
-    // double dis_to_goal_y = goal_.y - (robot_odom_.pose.pose.position.y
-    //                        - robot_odom_ini_.pose.pose.position.y);
-
-    // /*** 相対位置でのロボット(ロボットは0度とされる)とgoalの角度 ***/
-    // double angle_integrated = std::atan2(dis_to_goal_y, dis_to_goal_x);
-
-    // /*** ロボットの角度変化 ***/
-    // double angle_robot = robot_euler_ptr_ -> yaw_ - yaw_ini_;
-
-    // /*** ロボットからみたgoalへの角度 ***/
-    // double angle_to_goal = angle_integrated - angle_robot;
-
-    // /*** 直線距離(r)から、ロボットからgoalへのx,yの距離を算出 ***/
-    // double r = sqrt(dis_to_goal_x * dis_to_goal_x + dis_to_goal_y * dis_to_goal_y);
-    // goal_abs_.x = r * cos(angle_to_goal);
-    // goal_abs_.y = r * sin(angle_to_goal);
-
-    // cout << "x to goal: " << goal_abs_.x << endl;
-    // cout << "y to goal: " << goal_abs_.y << endl;
-
     goal_abs_ = relGoalToAbs(robot_odom_ini_, robot_odom_, yaw_ini_ ,robot_euler_ptr_->yaw_, goal_);
 
     if((goal_abs_.x < 0.2 && goal_abs_.x > -0.2) && (goal_abs_.y < 0.2 && goal_abs_.y > -0.2))
@@ -191,11 +175,15 @@ void PotentialAngle::onScanSubscribed(const sensor_msgs::msg::LaserScan::SharedP
       pub_angle_ -> publish(target_pub);
 
       /*** potential場を可視化するためにcsvファイルに保存 ***/
-      // create_potential_map();
+      #if DEBUG
+      create_potential_map();
+      #endif
       
       /*** ループ待機 ***/
+      #if !DEBUG
       rclcpp::WallRate loop_rate(100ms);
       loop_rate.sleep();
+      #endif
     }
   }
 }
@@ -211,7 +199,7 @@ void PotentialAngle::onOdomSubscribed(nav_msgs::msg::Odometry::SharedPtr msg)
   robot_euler_ptr_.reset(new struct RobotEuler(robot_odom_.pose.pose.orientation));
 }
 
-/*** goalを受信したら現在地点からgoalまでの位置関係の計算 ***/
+/*** goalを受信したら現在地点からgoalまでの位置関係を保持 ***/
 void PotentialAngle::onGoalSubscribed(std_msgs::msg::Float32MultiArray::SharedPtr msg)
 {
   std::lock_guard<std::mutex> lock(mutex_);
@@ -227,6 +215,26 @@ void PotentialAngle::onGoalSubscribed(std_msgs::msg::Float32MultiArray::SharedPt
 
   goal_ = rs::Pose2D(goal[0], goal[1], goal[2]);
   cout << "goal: " << goal_ << endl;
+
+  goal_flag_ = true;
+}
+
+/*** 2goalsを受信したら現在地点からgoalsまでの位置関係を保持 ***/
+void PotentialAngle::on2GoalsSubscribed(std_msgs::msg::Float32MultiArray::SharedPtr msg)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  vector<float> goal = msg->data;
+
+  if(goal.size() != 6){
+    cout << "Wrong Argumants: Usage is... [x(float),y(float),rad(float),x(float),y(float),rad(float)]" << endl;
+  }
+
+  /*** goal設定時の状態を初期状態として保存 ***/
+  robot_odom_ini_ = robot_odom_;
+  yaw_ini_        = robot_euler_ptr_ -> yaw_;
+
+  goal_ = rs::Pose2D(goal[0], goal[1], goal[2]);
+  goal_next_ = rs::Pose2D(goal[3], goal[4], goal[5]);
 
   goal_flag_ = true;
 }
